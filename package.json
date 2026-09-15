@@ -1,0 +1,22 @@
+{
+  "name": "reachdesk",
+  "version": "1.0.0",
+  "description": "Email and WhatsApp campaign manager: import leads from Excel or Google Sheets and send personalized outreach.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "demo": "node server/demo.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "multer": "^2.4.0",
+    "nodemailer": "^6.10.1",
+    "xlsx": "^0.18.5"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=18.17"
+  }
+}
