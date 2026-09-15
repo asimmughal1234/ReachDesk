@@ -1,16 +1,16 @@
 const router = require('express').Router();
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const multer = require('multer');
 const db = require('../lib/db');
-const jobs = require('../lib/jobs');
+const store = require('../lib/store');
+const sender = require('../lib/sender');
 const providers = require('../lib/providers');
 const { compose, suppressedSet, recipientFor, contactedSet } = require('../lib/compose');
-const { buildVars, missingKeys } = require('../lib/template');
+const { buildVars, missingKeys, slug } = require('../lib/template');
 const { toXlsxBuffer } = require('../lib/importer');
 
-const upload = multer({ dest: path.join(os.tmpdir(), 'reachdesk-uploads'), limits: { fileSize: 20 * 1024 * 1024, files: 5 } });
+// Vercel rejects request bodies over 4.5 MB, so attachments share a 4 MB budget.
+const MAX_ATTACH = 4 * 1024 * 1024;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_ATTACH, files: 5 } });
 
 const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const payloadOf = (req) => {
@@ -18,17 +18,19 @@ const payloadOf = (req) => {
   try { return JSON.parse(req.body.payload); } catch { throw bad('The campaign data could not be read. Reload the page and try again.'); }
 };
 const baseUrl = (req) => (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-const findCampaign = (id) => {
-  const c = db.data.campaigns.find((x) => x.id === id);
+const findCampaign = async (id, req) => {
+  const c = await store.loadCampaign(id, req.user.id);
   if (!c) throw bad('Campaign not found.', 404);
   return c;
 };
-const cleanupUploads = (req) => (req.files || []).forEach((f) => fs.rm(f.path, { force: true }, () => {}));
+const checkAttachments = (req) => {
+  if ((req.files || []).reduce((n, f) => n + f.size, 0) > MAX_ATTACH) throw bad('Attachments can total 4 MB at most.', 413);
+};
 
 // Turns the composer payload into a stored campaign snapshot (never includes credentials).
-function snapshot(p, req) {
+async function snapshot(p, req) {
   const channel = p.channel === 'whatsapp' ? 'whatsapp' : 'email';
-  const list = db.data.lists.find((l) => l.id === p.listId);
+  const list = db.rowTo.list(await db.one('select * from lists where id = $1 and user_id = $2', [p.listId, req.user.id]));
   if (!list) throw bad('Choose a contact list.');
   const m = p.message || {};
   if (channel === 'email' && !String(m.subject || '').trim()) throw bad('Add a subject line.');
@@ -37,6 +39,7 @@ function snapshot(p, req) {
   if (!String(m.body || '').trim() && !(channel === 'whatsapp' && wa.mode === 'cloud_template')) throw bad('The message body is empty.');
   const d = p.delivery || {};
   return {
+    userId: req.user.id,
     name: String(p.name || '').trim() || `${list.name} (${new Date().toLocaleDateString('en-GB')})`,
     channel,
     listId: list.id,
@@ -62,10 +65,10 @@ function snapshot(p, req) {
   };
 }
 
-function audience(c) {
-  const contacts = db.data.contacts.filter((x) => x.listId === c.listId);
-  const suppressed = suppressedSet();
-  const contacted = c.delivery.skipContacted ? contactedSet(c.channel) : new Set();
+async function audience(c) {
+  const contacts = (await db.q('select * from contacts where list_id = $1 order by created_at, id', [c.listId])).map(db.rowTo.contact);
+  const suppressed = await suppressedSet(c.userId);
+  const contacted = c.delivery.skipContacted ? await contactedSet(c.channel, c.userId) : new Set();
   const out = { eligible: [], missing: 0, suppressed: 0, contacted: 0, total: contacts.length };
   for (const ct of contacts) {
     const to = recipientFor(c.channel, ct);
@@ -77,13 +80,20 @@ function audience(c) {
   return out;
 }
 
-router.get('/', (req, res) => {
-  res.json(db.data.campaigns.map(jobs.publicCampaign).sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+async function contactsById(ids) {
+  if (!ids.length) return new Map();
+  const rows = await db.q('select * from contacts where id in (select jsonb_array_elements_text($1::text::jsonb))', [db.json(ids)]);
+  return new Map(rows.map((r) => [r.id, db.rowTo.contact(r)]));
+}
+
+router.get('/', async (req, res) => {
+  const rows = await db.q('select * from campaigns where user_id = $1 order by created_at desc', [req.user.id]);
+  res.json(rows.map((r) => store.publicCampaign(db.rowTo.campaign(r))));
 });
 
-router.post('/preview', (req, res) => {
-  const c = snapshot(req.body, req);
-  const a = audience(c);
+router.post('/preview', async (req, res) => {
+  const c = await snapshot(req.body, req);
+  const a = await audience(c);
   const missing = new Set();
   for (const ct of a.eligible.slice(0, 300)) {
     const vars = buildVars(ct, { sender_name: c.senderName, unsubscribe_url: 'x', campaign_name: c.name });
@@ -99,11 +109,13 @@ router.post('/preview', (req, res) => {
 
 router.post('/test', upload.array('attachments', 5), async (req, res) => {
   try {
+    checkAttachments(req);
     const p = payloadOf(req);
-    const c = snapshot(p, req);
+    const c = await snapshot(p, req);
     const to = String(p.test?.to || '').trim();
     if (!to) throw bad(c.channel === 'email' ? 'Enter an email address for the test.' : 'Enter a WhatsApp number for the test.');
-    const sample = audience(c).eligible[0] || db.data.contacts.find((x) => x.listId === c.listId) || {};
+    const sample = (await audience(c)).eligible[0]
+      || db.rowTo.contact(await db.one('select * from contacts where list_id = $1 order by created_at limit 1', [c.listId])) || {};
     const out = compose(c, sample);
     if (c.channel === 'email') {
       const smtp = providers.smtpConfig(p.runtime?.smtp);
@@ -113,7 +125,7 @@ router.post('/test', upload.array('attachments', 5), async (req, res) => {
           from: smtp.fromName ? { name: smtp.fromName, address: smtp.user || 'test@example.com' } : smtp.user || 'test@example.com',
           to, replyTo: smtp.replyTo || undefined,
           subject: `[Test] ${out.subject}`, text: out.text, html: out.html,
-          attachments: (req.files || []).map((f) => ({ filename: f.originalname, path: f.path })),
+          attachments: (req.files || []).map((f) => ({ filename: f.originalname, content: f.buffer, contentType: f.mimetype })),
         });
       } finally { t.close?.(); }
     } else {
@@ -129,125 +141,137 @@ router.post('/test', upload.array('attachments', 5), async (req, res) => {
     res.json({ ok: true, to });
   } catch (e) {
     throw Object.assign(new Error(providers.friendlyError(e)), { status: e.status || 400 });
-  } finally { cleanupUploads(req); }
-});
-
-router.post('/', upload.array('attachments', 5), (req, res) => {
-  try {
-    const p = payloadOf(req);
-    const c = { id: db.id('cmp'), ...snapshot(p, req), status: 'ready', createdAt: db.now(), attachments: [] };
-    const a = audience(c);
-    if (!a.eligible.length) throw bad('No one in this list can receive this campaign. Check the counts in the preview.');
-
-    if (req.files?.length) {
-      const dir = path.join(db.dataDir(), 'attachments', c.id);
-      fs.mkdirSync(dir, { recursive: true });
-      for (const f of req.files) {
-        const stored = `${Date.now()}_${f.originalname.replace(/[^\w.-]+/g, '_')}`;
-        fs.copyFileSync(f.path, path.join(dir, stored));
-        c.attachments.push({ name: f.originalname, stored, type: f.mimetype, size: f.size });
-      }
-    }
-
-    db.data.campaigns.push(c);
-    for (const ct of a.eligible) {
-      db.data.messages.push({
-        id: db.id('msg'), campaignId: c.id, contactId: ct.id, channel: c.channel,
-        to: recipientFor(c.channel, ct), status: 'queued', attempts: 0, createdAt: db.now(),
-      });
-    }
-    jobs.recount(c);
-    if (p.startNow !== false && !(c.channel === 'whatsapp' && c.wa.mode === 'links')) {
-      try { jobs.start(c, p.runtime); } catch (e) { c.lastError = e.message; }
-    }
-    db.save();
-    res.json(jobs.publicCampaign(c));
-  } finally { cleanupUploads(req); }
-});
-
-router.get('/:id', (req, res) => {
-  const c = findCampaign(req.params.id);
-  const status = req.query.status;
-  const limit = Math.min(Number(req.query.limit) || 100, 1000);
-  const offset = Number(req.query.offset) || 0;
-  let msgs = db.data.messages.filter((m) => m.campaignId === c.id && (!status || m.status === status));
-  const total = msgs.length;
-  msgs = msgs.slice(offset, offset + limit).map((m) => {
-    const ct = db.data.contacts.find((x) => x.id === m.contactId);
-    const row = { ...m, name: ct?.name || '' };
-    if (c.channel === 'whatsapp' && c.wa.mode === 'links' && m.status === 'queued' && ct) {
-      row.link = `https://wa.me/${m.to}?text=${encodeURIComponent(compose(c, ct).text)}`;
-    }
-    return row;
-  });
-  res.json({ campaign: jobs.publicCampaign(c), messages: msgs, total });
-});
-
-router.get('/:id/events', (req, res) => {
-  const c = findCampaign(req.params.id);
-  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  res.flushHeaders();
-  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  send({ campaign: jobs.publicCampaign(c) });
-  const key = `campaign:${c.id}`;
-  jobs.bus.on(key, send);
-  const ping = setInterval(() => res.write(': ping\n\n'), 20000);
-  req.on('close', () => { clearInterval(ping); jobs.bus.off(key, send); });
-});
-
-router.post('/:id/run', (req, res) => {
-  const c = findCampaign(req.params.id);
-  if (c.status === 'cancelled') throw bad('This campaign was cancelled.');
-  if (req.body?.limit !== undefined) c.delivery.limit = Math.max(0, Number(req.body.limit) || 0);
-  try { jobs.start(c, req.body?.runtime); } catch (e) { throw bad(e.message); }
-  res.json(jobs.publicCampaign(c));
-});
-
-for (const action of ['pause', 'resume', 'cancel']) {
-  router.post(`/:id/${action}`, (req, res) => {
-    const c = findCampaign(req.params.id);
-    if (!jobs.control(c.id, action)) {
-      if (action !== 'cancel') throw bad('This campaign is not sending right now.');
-      for (const m of db.data.messages) if (m.campaignId === c.id && m.status === 'queued') Object.assign(m, { status: 'skipped', error: 'Campaign cancelled' });
-      jobs.recount(c);
-      c.status = 'cancelled';
-      db.save();
-    }
-    setTimeout(() => res.json(jobs.publicCampaign(c)), 50);
-  });
-}
-
-router.post('/:id/retry-failed', (req, res) => {
-  const c = findCampaign(req.params.id);
-  let n = 0;
-  for (const m of db.data.messages) {
-    if (m.campaignId === c.id && m.status === 'failed') { m.status = 'queued'; m.error = ''; n += 1; }
   }
-  jobs.recount(c);
-  if (n && !jobs.isActive(c.id)) c.status = 'ready';
-  db.save();
-  res.json({ requeued: n, campaign: jobs.publicCampaign(c) });
 });
 
-router.post('/:id/messages/:mid', (req, res) => {
-  const c = findCampaign(req.params.id);
-  const m = db.data.messages.find((x) => x.id === req.params.mid && x.campaignId === c.id);
-  if (!m) throw bad('Message not found.', 404);
+router.post('/', upload.array('attachments', 5), async (req, res) => {
+  checkAttachments(req);
+  const p = payloadOf(req);
+  const c = { id: db.id('cmp'), ...(await snapshot(p, req)), status: 'ready', createdAt: db.now(), attachments: [], runRemaining: null };
+  const a = await audience(c);
+  if (!a.eligible.length) throw bad('No one in this list can receive this campaign. Check the counts in the preview.');
+
+  const links = c.channel === 'whatsapp' && c.wa.mode === 'links';
+  if (p.startNow !== false && !links) {
+    const problem = sender.credentialProblem(c, p.runtime);
+    if (problem) c.lastError = problem;
+    else Object.assign(c, { status: 'running', runRemaining: c.delivery.limit || null, lastRunAt: db.now() });
+  }
+  c.attachments = (req.files || []).map((f) => ({ id: db.id('att'), name: f.originalname, type: f.mimetype, size: f.size }));
+  await store.insertCampaign(c);
+  for (const [i, f] of (req.files || []).entries()) {
+    const att = c.attachments[i];
+    await db.q('insert into attachments (id, campaign_id, name, type, size, data) values ($1, $2, $3, $4, $5, $6)', [att.id, c.id, att.name, att.type, att.size, f.buffer]);
+  }
+  // Timestamps a millisecond apart keep the list order as the send order.
+  const base = Date.now();
+  await db.insertMany('messages', db.COLS.messages, a.eligible.map((ct, i) => db.toRow.message({
+    id: db.id('msg'), userId: c.userId, campaignId: c.id, contactId: ct.id, channel: c.channel,
+    to: recipientFor(c.channel, ct), status: 'queued', createdAt: new Date(base + i).toISOString(),
+  })));
+  await store.recount(c);
+  await store.saveCampaign(c);
+  res.json(store.publicCampaign(c));
+});
+
+router.get('/:id', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  const status = String(req.query.status || '');
+  const limit = Math.min(Number(req.query.limit) || 100, 1000);
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const where = "m.campaign_id = $1 and ($2 = '' or m.status = $2 or ($2 = 'queued' and m.status = 'sending'))";
+  const [{ n }] = await db.q(`select count(*)::int as n from messages m where ${where}`, [c.id, status]);
+  const rows = await db.q(`select m.*, ct.name as contact_name from messages m left join contacts ct on ct.id = m.contact_id
+    where ${where} order by m.created_at, m.id limit $3 offset $4`, [c.id, status, limit, offset]);
+  const links = c.channel === 'whatsapp' && c.wa.mode === 'links';
+  const contacts = links ? await contactsById(rows.filter((r) => r.status === 'queued').map((r) => r.contact_id)) : new Map();
+  const messages = rows.map((r) => {
+    const m = { ...db.rowTo.message(r), name: r.contact_name || '' };
+    const ct = contacts.get(r.contact_id);
+    if (links && m.status === 'queued' && ct) m.link = `https://wa.me/${m.to}?text=${encodeURIComponent(compose(c, ct).text)}`;
+    return m;
+  });
+  res.json({ campaign: store.publicCampaign(c), messages, total: n });
+});
+
+router.post('/:id/run', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  if (c.status === 'cancelled') throw bad('This campaign was cancelled.');
+  if (c.status === 'running') throw bad('This campaign is already sending.');
+  if (c.channel === 'whatsapp' && c.wa.mode === 'links') throw bad('Click-to-chat campaigns are sent by hand from the campaign page.');
+  if (req.body?.limit !== undefined) c.delivery.limit = Math.max(0, Number(req.body.limit) || 0);
+  const problem = sender.credentialProblem(c, req.body?.runtime);
+  if (problem) throw bad(problem);
+  Object.assign(c, { status: 'running', runRemaining: c.delivery.limit || null, lastRunAt: db.now(), lastError: '' });
+  await store.saveCampaign(c);
+  await db.q('update campaigns set next_send_at = null where id = $1', [c.id]);
+  res.json(store.publicCampaign(c));
+});
+
+router.post('/:id/send-next', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  res.json(await sender.sendNext(c, req.body?.runtime || {}));
+});
+
+router.post('/:id/pause', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  if (c.status !== 'running') throw bad('This campaign is not sending right now.');
+  c.status = 'paused';
+  await store.saveCampaign(c);
+  res.json(store.publicCampaign(c));
+});
+
+router.post('/:id/resume', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  if (c.status !== 'paused') throw bad('This campaign is not paused.');
+  c.status = 'running';
+  await store.saveCampaign(c);
+  res.json(store.publicCampaign(c));
+});
+
+router.post('/:id/cancel', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  if (c.status !== 'cancelled') {
+    await db.q("update messages set status = 'skipped', error = 'Campaign cancelled', updated_at = $2 where campaign_id = $1 and status in ('queued', 'sending')", [c.id, db.now()]);
+    c.status = 'cancelled';
+    await store.recount(c);
+    await store.saveCampaign(c);
+  }
+  res.json(store.publicCampaign(c));
+});
+
+router.post('/:id/retry-failed', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  const rows = await db.q("update messages set status = 'queued', error = '' where campaign_id = $1 and status = 'failed' returning id", [c.id]);
+  if (rows.length && c.status !== 'running') c.status = 'ready';
+  await store.recount(c);
+  await store.saveCampaign(c);
+  res.json({ requeued: rows.length, campaign: store.publicCampaign(c) });
+});
+
+router.post('/:id/messages/:mid', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
   const status = req.body?.status;
   if (!['sent', 'queued', 'skipped'].includes(status)) throw bad('Unknown status.');
-  Object.assign(m, { status, sentAt: status === 'sent' ? db.now() : m.sentAt, error: status === 'skipped' ? 'Skipped by you' : '', updatedAt: db.now() });
-  const s = jobs.recount(c);
-  if (!jobs.isActive(c.id) && c.status !== 'cancelled') c.status = s.queued ? 'ready' : 'completed';
-  db.save();
-  jobs.bus.emit(`campaign:${c.id}`, { campaign: jobs.publicCampaign(c), message: m });
-  res.json({ message: m, campaign: jobs.publicCampaign(c) });
+  const row = await db.one(`update messages set status = $3,
+      sent_at = case when $3 = 'sent' then $4 else sent_at end,
+      error = case when $3 = 'skipped' then 'Skipped by you' else '' end,
+      updated_at = $4
+    where id = $1 and campaign_id = $2 returning *`, [req.params.mid, c.id, status, db.now()]);
+  if (!row) throw bad('Message not found.', 404);
+  const s = await store.recount(c);
+  if (c.status !== 'running' && c.status !== 'cancelled') c.status = s.queued ? 'ready' : 'completed';
+  await store.saveCampaign(c);
+  res.json({ message: db.rowTo.message(row), campaign: store.publicCampaign(c) });
 });
 
-router.get('/:id/export', (req, res) => {
-  const c = findCampaign(req.params.id);
-  const rows = db.data.messages.filter((m) => m.campaignId === c.id).map((m) => {
-    const ct = db.data.contacts.find((x) => x.id === m.contactId);
-    const original = ct?.headers ? Object.fromEntries(ct.headers.map((h) => [h, ct.fields[require('../lib/template').slug(h)] ?? ''])) : {};
+router.get('/:id/export', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  const rows = await db.q(`select m.*, ct.headers, ct.fields from messages m left join contacts ct on ct.id = m.contact_id
+    where m.campaign_id = $1 order by m.created_at, m.id`, [c.id]);
+  const out = rows.map((r) => {
+    const m = db.rowTo.message(r);
+    const original = r.headers ? Object.fromEntries(r.headers.map((h) => [h, r.fields?.[slug(h)] ?? ''])) : {};
     return {
       ...original,
       campaign_name: c.name,
@@ -262,16 +286,13 @@ router.get('/:id/export', (req, res) => {
   });
   const file = `${c.name.replace(/[^\w-]+/g, '_').slice(0, 60) || 'campaign'}_results.xlsx`;
   res.set({ 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${file}"` });
-  res.send(toXlsxBuffer(rows));
+  res.send(toXlsxBuffer(out));
 });
 
-router.delete('/:id', (req, res) => {
-  const c = findCampaign(req.params.id);
-  if (jobs.isActive(c.id)) throw bad('Stop this campaign before deleting it.');
-  db.data.campaigns = db.data.campaigns.filter((x) => x.id !== c.id);
-  db.data.messages = db.data.messages.filter((m) => m.campaignId !== c.id);
-  fs.rm(path.join(db.dataDir(), 'attachments', c.id), { recursive: true, force: true }, () => {});
-  db.save();
+router.delete('/:id', async (req, res) => {
+  const c = await findCampaign(req.params.id, req);
+  if (c.status === 'running') throw bad('Pause this campaign before deleting it.');
+  await db.q('delete from campaigns where id = $1', [c.id]); // messages and attachments go with it
   res.json({ ok: true });
 });
 

@@ -1,6 +1,6 @@
-import { $, $$, esc, toast } from './ui.js';
+import { $, $$, esc, toast, busy } from './ui.js';
 import { api, setToken, handleUnauthorized } from './api.js';
-import { setServerStatus, emailReady, whatsappReady, getSenders } from './store.js';
+import { setServerStatus, setAccount, emailReady, whatsappReady, getSenders } from './store.js';
 import { dashboard } from './views/dashboard.js';
 import { contacts } from './views/contacts.js';
 import { templates } from './views/templates.js';
@@ -47,27 +47,58 @@ function senderNote() {
   $('#sender-note').innerHTML = parts.join('<br>');
 }
 
-function showLogin() {
-  document.body.innerHTML = `<div class="login"><form class="panel">
-    <div><h1>Sign in to ReachDesk</h1><p class="muted" style="margin-top:6px">Enter the workspace password set by your admin.</p></div>
-    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
-    <button class="btn primary" type="submit">Sign in</button>
-  </form></div>`;
-  const form = $('form');
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    try {
-      const { token: t } = await api('/auth/login', { method: 'POST', body: { password: form.password.value } });
-      setToken(t);
-      location.reload();
-    } catch (err) { toast(err.message); }
+function drawUser(user) {
+  $('#rail-user').innerHTML = `<span title="${esc(user.email)}"><b>${esc(user.name || user.email)}</b></span>
+    <button class="btn sm ghost" data-logout>Sign out</button>`;
+  $('[data-logout]').onclick = async () => {
+    await api('/auth/logout', { method: 'POST' }).catch(() => {});
+    setToken('');
+    location.hash = '#/';
+    location.reload();
   };
 }
 
+function showAuth(mode, signupOpen) {
+  const signup = mode === 'signup';
+  document.body.innerHTML = `<div class="login"><form class="panel" novalidate>
+    <div><h1>${signup ? 'Create your account' : 'Sign in to ReachDesk'}</h1>
+      <p class="muted" style="margin-top:6px">${signup ? 'Your lists, templates and campaigns stay private to your account.' : 'Welcome back. Sign in to see your lists and campaigns.'}</p></div>
+    ${signup ? '<label class="field">Your name<input type="text" name="name" autocomplete="name" required></label>' : ''}
+    <label class="field">Email<input type="email" name="email" autocomplete="email" required></label>
+    <label class="field">Password<input type="password" name="password" autocomplete="${signup ? 'new-password' : 'current-password'}" required>${signup ? '<span class="hint">At least 8 characters.</span>' : ''}</label>
+    ${signup ? '<label class="field">Invite code<input type="text" name="invite" autocomplete="off" required><span class="hint">Ask your admin for this code.</span></label>' : ''}
+    <button class="btn primary" type="submit" data-busy="${signup ? 'Creating account' : 'Signing in'}">${signup ? 'Create account' : 'Sign in'}</button>
+    ${signupOpen ? `<p class="muted small auth-switch">${signup ? 'Already have an account?' : 'New to ReachDesk?'} <a href="#" data-switch>${signup ? 'Sign in' : 'Create an account'}</a></p>` : ''}
+  </form></div><div id="toasts" aria-live="polite"></div>`;
+  const form = $('form');
+  const sw = $('[data-switch]');
+  if (sw) sw.onclick = (e) => { e.preventDefault(); showAuth(signup ? 'login' : 'signup', signupOpen); };
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $('button[type=submit]', form);
+    try {
+      await busy(btn, async () => {
+        const { token: t } = await api(signup ? '/auth/signup' : '/auth/login', { method: 'POST', body: Object.fromEntries(new FormData(form)) });
+        setToken(t);
+      });
+      location.reload();
+    } catch (err) { toast(err.message); }
+  };
+  setTimeout(() => $('input', form)?.focus(), 30);
+}
+
 async function boot() {
-  handleUnauthorized(() => { setToken(''); showLogin(); });
-  const auth = await api('/auth/status').catch(() => ({ ok: true }));
-  if (!auth.ok) return showLogin();
+  let signupOpen = false;
+  handleUnauthorized(() => { setToken(''); showAuth('login', signupOpen); });
+  const auth = await api('/auth/status').catch(() => null);
+  if (!auth) {
+    $('#view').innerHTML = '<div class="page empty"><h3>Could not reach the server</h3><p>Check that ReachDesk is running, then reload.</p><button class="btn" onclick="location.reload()">Reload</button></div>';
+    return;
+  }
+  signupOpen = auth.signupOpen;
+  if (!auth.ok) return showAuth(auth.setup && signupOpen ? 'signup' : 'login', signupOpen);
+  setAccount(auth.user.id);
+  drawUser(auth.user);
   api('/senders/status').then(setServerStatus).catch(() => {});
   window.addEventListener('senders-changed', senderNote);
   window.addEventListener('hashchange', render);

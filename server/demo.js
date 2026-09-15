@@ -2,4 +2,5 @@
 // Works on Windows, macOS and Linux: npm run demo
 process.env.MAIL_TRANSPORT = 'json';
 process.env.WA_DRY_RUN = '1';
+process.env.SIGNUP_CODE = process.env.SIGNUP_CODE || 'demo'; // invite code for creating demo accounts
 require('./index');

@@ -1,18 +1,30 @@
 // Sender credentials live in memory by default. They are saved in this
-// browser only when the user ticks "Remember on this device".
+// browser only when the user ticks "Remember on this device", separately for each account.
 const KEY = 'rd.senders';
 const PREFS = 'rd.prefs';
 
 const blank = () => ({ remember: false, smtp: { user: '', pass: '', fromName: '', replyTo: '', host: 'smtp.gmail.com', port: 465 }, wa: { token: '', phoneNumberId: '', version: 'v21.0' } });
-let senders = (() => { try { return { ...blank(), ...JSON.parse(localStorage.getItem(KEY)) }; } catch { return blank(); } })() || blank();
+let key = KEY;
+const read = () => { try { return { ...blank(), ...JSON.parse(localStorage.getItem(key)) }; } catch { return blank(); } };
+let senders = blank();
 let prefs = (() => { try { return { countryCode: '92', ...JSON.parse(localStorage.getItem(PREFS)) }; } catch { return { countryCode: '92' }; } })();
 let serverStatus = { emailFromEnv: false, whatsappFromEnv: false };
+
+export function setAccount(id) {
+  key = `${KEY}.${id}`;
+  // Details saved before accounts existed go to the first account that signs in on this browser.
+  const legacy = localStorage.getItem(KEY);
+  if (legacy && !localStorage.getItem(key)) localStorage.setItem(key, legacy);
+  localStorage.removeItem(KEY);
+  senders = read();
+  window.dispatchEvent(new Event('senders-changed'));
+}
 
 export const getSenders = () => senders;
 export function setSenders(next) {
   senders = next;
-  if (next.remember) localStorage.setItem(KEY, JSON.stringify(next));
-  else localStorage.removeItem(KEY);
+  if (next.remember) localStorage.setItem(key, JSON.stringify(next));
+  else localStorage.removeItem(key);
   window.dispatchEvent(new Event('senders-changed'));
 }
 export const getPrefs = () => prefs;

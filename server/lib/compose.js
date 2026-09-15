@@ -42,16 +42,17 @@ function compose(campaign, contact) {
   return { text, params };
 }
 
-function suppressedSet() {
-  return new Set(db.data.suppression.map((s) => s.value));
+async function suppressedSet(userId) {
+  return new Set((await db.q('select value from suppression where user_id = $1', [userId])).map((r) => r.value));
 }
 
 function recipientFor(channel, contact) {
   return channel === 'email' ? contact.email : contact.phone;
 }
 
-function contactedSet(channel) {
-  return new Set(db.data.messages.filter((m) => m.channel === channel && m.status === 'sent').map((m) => m.to));
+async function contactedSet(channel, userId) {
+  const rows = await db.q("select distinct recipient from messages where user_id = $1 and channel = $2 and status = 'sent'", [userId, channel]);
+  return new Set(rows.map((r) => r.recipient));
 }
 
 module.exports = { compose, suppressedSet, recipientFor, contactedSet, unsubscribeUrl, isPublicUrl, REPLY_OPT_OUT };

@@ -6,6 +6,7 @@ import { openImportModal, openManageLists } from './contacts.js';
 import { openTemplateEditor } from './templates.js';
 
 const REPLY_OPT_OUT = 'P.S. If this isn\'t relevant, just reply "no" and I won\'t email you again.';
+const MAX_ATTACH = 4 * 1024 * 1024; // hosting limit on request size
 const DEFAULT_FOOTER = {
   email: REPLY_OPT_OUT,
   whatsapp: 'Reply STOP to stop receiving messages.',
@@ -91,7 +92,7 @@ export async function compose(el, { query }) {
             <div>
               <div class="files" data-files></div>
               <label class="btn sm" style="margin-top:8px">${icons.plus}Attach files<input type="file" multiple hidden data-attach></label>
-              <span class="muted small">&nbsp;Up to 5 files, 20 MB each.</span>
+              <span class="muted small">&nbsp;Up to 5 files, 4 MB in total.</span>
             </div>
             <label class="check"><input type="checkbox" data-k="html"><span>Send an HTML version too<small>Leave off for first-contact emails. Plain text looks like a personal email; formatted mail is more likely to land in Promotions or Spam.</small></span></label>
           </div>
@@ -337,7 +338,9 @@ export async function compose(el, { query }) {
   q('[data-attach]').onchange = (e) => {
     const files = [...e.target.files];
     if (st.files.length + files.length > 5) toast('You can attach up to 5 files.');
-    st.files = [...st.files, ...files].slice(0, 5);
+    const next = [...st.files, ...files].slice(0, 5);
+    if (next.reduce((n, f) => n + f.size, 0) > MAX_ATTACH) toast('Attachments can total 4 MB at most. Share a link to bigger files instead.');
+    else st.files = next;
     e.target.value = '';
     drawFiles();
     drawPreview();
@@ -363,7 +366,7 @@ export async function compose(el, { query }) {
     try {
       const c = await api('/campaigns', { method: 'POST', form: formData() });
       if (c.lastError) toast(`Campaign created but not started: ${c.lastError}`);
-      else toast(c.channel === 'whatsapp' && c.wa.mode === 'links' ? 'Chat list ready. Open each chat to send.' : 'Campaign started.', 'ok');
+      else toast(c.channel === 'whatsapp' && c.wa.mode === 'links' ? 'Chat list ready. Open each chat to send.' : 'Campaign started. Keep its page open while it sends.', 'ok');
       location.hash = `#/campaigns/${c.id}`;
     } catch (e) { toast(e.message); }
   });

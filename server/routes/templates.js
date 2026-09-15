@@ -1,9 +1,10 @@
 const router = require('express').Router();
 const db = require('../lib/db');
 
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const ch = req.query.channel;
-  res.json(db.data.templates.filter((t) => !ch || t.channel === ch).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+  const rows = await db.q(`select * from templates where user_id = $1 ${ch ? 'and channel = $2' : ''} order by updated_at desc`, ch ? [req.user.id, ch] : [req.user.id]);
+  res.json(rows.map(db.rowTo.template));
 });
 
 function clean(b = {}) {
@@ -15,24 +16,22 @@ function clean(b = {}) {
   return { channel, name, subject: channel === 'email' ? String(b.subject || '') : '', body };
 }
 
-router.post('/', (req, res) => {
-  const t = { id: db.id('tpl'), ...clean(req.body), createdAt: db.now(), updatedAt: db.now() };
-  db.data.templates.push(t);
-  db.save();
+router.post('/', async (req, res) => {
+  const t = { id: db.id('tpl'), userId: req.user.id, ...clean(req.body), createdAt: db.now(), updatedAt: db.now() };
+  await db.insertMany('templates', db.COLS.templates, [db.toRow.template(t)]);
   res.json(t);
 });
 
-router.put('/:id', (req, res) => {
-  const t = db.data.templates.find((x) => x.id === req.params.id);
-  if (!t) return res.status(404).json({ error: 'Template not found.' });
-  Object.assign(t, clean(req.body), { updatedAt: db.now() });
-  db.save();
-  res.json(t);
+router.put('/:id', async (req, res) => {
+  const b = clean(req.body);
+  const row = await db.one(`update templates set channel = $3, name = $4, subject = $5, body = $6, updated_at = $7
+    where id = $1 and user_id = $2 returning *`, [req.params.id, req.user.id, b.channel, b.name, b.subject, b.body, db.now()]);
+  if (!row) return res.status(404).json({ error: 'Template not found.' });
+  res.json(db.rowTo.template(row));
 });
 
-router.delete('/:id', (req, res) => {
-  db.data.templates = db.data.templates.filter((t) => t.id !== req.params.id);
-  db.save();
+router.delete('/:id', async (req, res) => {
+  await db.q('delete from templates where id = $1 and user_id = $2', [req.params.id, req.user.id]);
   res.json({ ok: true });
 });
 

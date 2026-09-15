@@ -33,6 +33,10 @@ export async function campaignDetail(el, { id }) {
   let data = await api(`/campaigns/${id}?limit=${PAGE}`);
   let c = data.campaign;
   const links = c.channel === 'whatsapp' && c.wa.mode === 'links';
+  let nextAt = 0; // when this page will ask the server to send again
+  const nextText = () => (nextAt
+    ? `Next ${c.channel === 'email' ? 'email' : 'message'} in ${Math.max(0, Math.ceil((nextAt - Date.now()) / 1000))}s`
+    : 'Sending…');
 
   el.innerHTML = `<div class="page">
     <header class="page-head">
@@ -59,6 +63,7 @@ export async function campaignDetail(el, { id }) {
       <div class="progress" role="progressbar" aria-valuenow="${Math.round(pct(done))}" aria-valuemin="0" aria-valuemax="100">
         <i class="p-sent" style="width:${pct(s.sent)}%"></i><i class="p-failed" style="width:${pct(s.failed)}%"></i><i class="p-skipped" style="width:${pct(s.skipped)}%"></i>
       </div>
+      ${c.status === 'running' && !links ? `<div class="notice" style="margin-top:14px"><b data-next-in>${nextText()}</b>. Sending runs from this page, so keep it open. Closing it pauses sending until you open it again.</div>` : ''}
       ${c.lastError ? `<div class="notice warn" style="margin-top:14px"><b>Sending stopped.</b> ${esc(c.lastError)} Fix it in <a href="#/settings">Settings</a>, then continue.</div>` : ''}
       ${links && s.queued ? '<div class="notice" style="margin-top:14px">Open each chat below. WhatsApp opens with the message filled in, you press send, and the row is marked as sent.</div>' : ''}
       <div class="kpis">
@@ -140,27 +145,59 @@ export async function campaignDetail(el, { id }) {
     $$('[data-undo]', box).forEach((b) => { b.onclick = () => mark(b.dataset.undo, 'queued'); });
   }
 
-  let pending = false;
   async function refresh() {
     data = await api(`/campaigns/${id}?limit=${PAGE}&offset=${offset}${filter ? `&status=${filter}` : ''}`);
     c = data.campaign;
     drawSummary(); drawActions(); drawMessages();
+    if (c.status === 'running') pump();
   }
-  const drawAll = () => { drawSummary(); drawActions(); drawMessages(); };
-  drawAll();
 
-  // Live updates while sending.
-  const es = new EventSource(withToken(`/api/campaigns/${id}/events`));
-  es.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    const statusChanged = ev.campaign.status !== c.status;
-    c = ev.campaign;
-    drawSummary();
-    if (statusChanged) drawActions();
-    if (ev.message && !pending) {
-      pending = true;
-      setTimeout(() => { pending = false; refresh().catch(() => {}); }, 700);
-    }
+  // Sending runs from this page: each request sends one message, then the page waits the
+  // gap the server asks for. Leaving the page pauses sending until someone opens it again.
+  let alive = true;
+  let pumping = false;
+  let pending = false;
+  let timer = null;
+  const wait = (ms) => new Promise((resolve) => { timer = setTimeout(resolve, ms); });
+  const refreshSoon = () => {
+    if (pending) return;
+    pending = true;
+    setTimeout(() => { pending = false; if (alive) refresh().catch(() => {}); }, 700);
   };
-  return () => es.close();
+  async function pump() {
+    if (pumping || links) return;
+    pumping = true;
+    try {
+      while (alive && c.status === 'running') {
+        let r;
+        try {
+          r = await api(`/campaigns/${c.id}/send-next`, { method: 'POST', body: { runtime: runtime() } });
+        } catch (e) {
+          if (!alive) break;
+          toast(`${e.message} Trying again in 15 seconds.`);
+          nextAt = Date.now() + 15000;
+          await wait(15000);
+          continue;
+        }
+        if (!alive) break;
+        const changed = r.campaign.status !== c.status;
+        c = r.campaign;
+        nextAt = c.status === 'running' && r.waitMs ? Date.now() + r.waitMs : 0;
+        drawSummary();
+        if (changed) drawActions();
+        if (r.message || changed) refreshSoon();
+        if (c.status !== 'running') break;
+        await wait(Math.max(500, r.waitMs || 0));
+      }
+    } finally {
+      pumping = false;
+      nextAt = 0;
+      if (alive) drawSummary();
+    }
+  }
+
+  const tick = setInterval(() => { const n = $('[data-next-in]', el); if (n) n.textContent = nextText(); }, 1000);
+  drawSummary(); drawActions(); drawMessages();
+  if (c.status === 'running') pump();
+  return () => { alive = false; clearTimeout(timer); clearInterval(tick); };
 }
