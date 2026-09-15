@@ -90,9 +90,10 @@ function showAuth(mode, signupOpen) {
 async function boot() {
   let signupOpen = false;
   handleUnauthorized(() => { setToken(''); showAuth('login', signupOpen); });
-  const auth = await api('/auth/status').catch(() => null);
-  if (!auth) {
-    $('#view').innerHTML = '<div class="page empty"><h3>Could not reach the server</h3><p>Check that ReachDesk is running, then reload.</p><button class="btn" onclick="location.reload()">Reload</button></div>';
+  // Show the server's own reason (for example a missing database), not a generic message.
+  const auth = await api('/auth/status').catch((e) => ({ failed: e.message }));
+  if (auth.failed) {
+    $('#view').innerHTML = `<div class="page empty"><h3>ReachDesk is not ready</h3><p>${esc(auth.failed)}</p><button class="btn" onclick="location.reload()">Reload</button></div>`;
     return;
   }
   signupOpen = auth.signupOpen;
